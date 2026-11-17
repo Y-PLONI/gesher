@@ -1,0 +1,226 @@
+name: release
+
+# Prepares a GitHub Release for Windows (docs/updates.md, "Preparing a release
+# asset"). It never builds anything: it takes the installer that a successful
+# `ci` run already built and tested, checks it again, and attaches it unchanged.
+#
+#   1. Run `ci` on the intended commit with `release_version` = X.Y.Z, and wait
+#      for the whole run to succeed.
+#   2. Run this workflow on the same commit (Actions > release > Run workflow)
+#      with the same version. By default it creates a DRAFT release: review it,
+#      then publish it on GitHub. The updater only offers published, stable
+#      releases, and only the one GitHub marks as the latest.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (X.Y.Z); must equal the release_version the ci run was started with'
+        required: true
+        type: string
+      run_id:
+        description: 'ID of the successful ci run to release; leave empty to use the newest successful ci run for this commit'
+        required: false
+        default: ''
+        type: string
+      draft:
+        description: 'Create a draft to review and publish by hand (recommended). Unchecked publishes immediately.'
+        required: true
+        default: true
+        type: boolean
+      notes:
+        description: 'Release notes, placed above the generated change list (optional)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write  # create the tag and the release
+  actions: read    # find the ci run and download its artifact
+
+# One release at a time; a half-finished one is never cancelled.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Inputs reach the scripts as environment variables, never as text pasted
+      # into them.
+      INPUT_VERSION: ${{ inputs.version }}
+      INPUT_RUN_ID: ${{ inputs.run_id }}
+      INPUT_DRAFT: ${{ inputs.draft }}
+      INPUT_NOTES: ${{ inputs.notes }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tools/package
+            tools/surface
+
+      - name: Validate version and find the tested ci run
+        id: ci
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Gh {
+            $out = & gh @args
+            if ($LASTEXITCODE -ne 0) { throw "gh $($args -join ' ') failed with exit code $LASTEXITCODE" }
+            $out
+          }
+
+          $version = $env:INPUT_VERSION
+          # The same rule as the package job and the updater.
+          if ($version -cnotmatch '\A(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\z' -or
+              @($version.Split('.') | Where-Object { [int]$_ -gt 65535 }).Count) {
+            throw 'Version must be X.Y.Z, with decimal components from 0 through 65535 and no leading zeros.'
+          }
+          $tag = "v$version"
+          $repo = $env:GITHUB_REPOSITORY
+          if ($repo -cne 'gesher-runtime/gesher') {
+            Write-Warning "The updater only reads releases of gesher-runtime/gesher; a release of $repo will not be offered to installed copies."
+          }
+
+          # The tag and the release must both be new: a release is never replaced.
+          & gh api "repos/$repo/git/ref/tags/$tag" *> $null
+          if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists." }
+          $existing = @(Gh api "repos/$repo/releases?per_page=100" --paginate --jq ".[] | select(.tag_name == `"$tag`") | .html_url")
+          if ($existing.Count) { throw "A release for $tag already exists: $($existing -join ', ')" }
+
+          if ($env:INPUT_RUN_ID) {
+            if ($env:INPUT_RUN_ID -notmatch '\A[1-9][0-9]*\z') { throw 'run_id must be a number.' }
+            $run = Gh api "repos/$repo/actions/runs/$env:INPUT_RUN_ID" | ConvertFrom-Json
+          } else {
+            $runs = (Gh api "repos/$repo/actions/workflows/ci.yml/runs?event=workflow_dispatch&status=success&head_sha=$env:GITHUB_SHA&per_page=1" | ConvertFrom-Json).workflow_runs
+            if (-not $runs) {
+              throw "No successful ci run of $env:GITHUB_SHA was started by hand. Run ci on this commit with release_version=$version first, or pass run_id."
+            }
+            $run = $runs[0]
+          }
+
+          # Everything the release will carry must come from this repository's own
+          # ci workflow, a run that finished successfully, started by hand.
+          if ($run.path -cne '.github/workflows/ci.yml' -or $run.event -cne 'workflow_dispatch' -or
+              $run.status -cne 'completed' -or $run.conclusion -cne 'success' -or
+              $run.repository.full_name -cne $repo -or $run.head_repository.full_name -cne $repo) {
+            throw "Run $($run.id) is not a successful, manually started ci run of $repo (path=$($run.path) event=$($run.event) status=$($run.status) conclusion=$($run.conclusion))."
+          }
+          $sha = $run.head_sha
+          if ($sha -cnotmatch '\A[0-9a-f]{40}\z') { throw 'The ci run has no valid commit.' }
+
+          # Only a commit on the default branch can be released.
+          $relation = Gh api "repos/$repo/compare/$($env:DEFAULT_BRANCH)...$sha" --jq .status
+          if ($relation -cne 'identical' -and $relation -cne 'behind') {
+            throw "Commit $sha is not part of $($env:DEFAULT_BRANCH) (compare status: $relation)."
+          }
+
+          # The installer artifact of that very run.
+          $inventory = Gh api "repos/$repo/actions/runs/$($run.id)/artifacts?name=gesher-setup&per_page=100" | ConvertFrom-Json
+          $artifacts = @($inventory.artifacts | Where-Object { $_.name -ceq 'gesher-setup' })
+          if ($artifacts.Count -ne 1) { throw "Expected exactly one gesher-setup artifact in run $($run.id), found $($artifacts.Count)." }
+          $artifact = $artifacts[0]
+          if ($artifact.expired) { throw 'The gesher-setup artifact has expired; run ci again.' }
+          if ($artifact.digest -cnotmatch '\Asha256:[0-9a-f]{64}\z') { throw 'The gesher-setup artifact has no SHA-256 digest.' }
+          if ([string]$artifact.workflow_run.head_sha -cne $sha) { throw 'The artifact belongs to another commit.' }
+
+          "version=$version", "tag=$tag", "sha=$sha", "run=$($run.id)", "run_url=$($run.html_url)",
+            "artifact_id=$($artifact.id)", "artifact_digest=$($artifact.digest)" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Releasing $tag from commit $sha, ci run $($run.id), artifact $($artifact.id)."
+
+      # tools/surface/download-verified-artifact.py hashes the archive against the
+      # API digest before it extracts anything, as the CI jobs do.
+      - name: Download the installer artifact and verify it
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ci.outputs.version }}
+          ARTIFACT_ID: ${{ steps.ci.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ steps.ci.outputs.artifact_digest }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tools/surface/download-verified-artifact.py --id $env:ARTIFACT_ID --digest $env:ARTIFACT_DIGEST --destination release-assets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $name = "gesher-setup-$env:VERSION.exe"
+          $files = @(Get-ChildItem -LiteralPath release-assets -File -Recurse)
+          $expected = @($name, 'SHA256SUMS.txt')
+          $unexpected = @($files | Where-Object { $_.Name -cnotin $expected -or $_.DirectoryName -ne (Resolve-Path release-assets).Path })
+          if ($unexpected.Count -or $files.Count -ne 2) {
+            throw "The artifact must contain exactly $($expected -join ' and '); it contains: $(($files | ForEach-Object Name) -join ', '). Was ci started with release_version=$env:VERSION?"
+          }
+          $setup = Join-Path release-assets $name
+          $sums = Join-Path release-assets 'SHA256SUMS.txt'
+
+          $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          $line = (Get-Content -LiteralPath $sums -Raw).Trim()
+          if ($line -cne "$hash  $name") { throw "SHA256SUMS.txt does not describe $name (computed $hash)." }
+
+          # The same product-version rule the updater applies before it runs Setup.
+          . ./tools/package/gesher-update.ps1
+          $productVersion = Get-GesherUpdateInstallerVersion -Path $setup
+          if ($productVersion -cne $env:VERSION) {
+            throw "Installer product version '$productVersion' differs from the release version '$env:VERSION'."
+          }
+          if ((Get-Item -LiteralPath $setup).Length -le 0) { throw 'The installer is empty.' }
+          "PASS  $name is $((Get-Item -LiteralPath $setup).Length) bytes, SHA-256 $hash, product version $productVersion" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Create the release
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ci.outputs.version }}
+          TAG: ${{ steps.ci.outputs.tag }}
+          SHA: ${{ steps.ci.outputs.sha }}
+          RUN_ID: ${{ steps.ci.outputs.run }}
+          RUN_URL: ${{ steps.ci.outputs.run_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $notes = @()
+          $extra = "$env:INPUT_NOTES".Trim()
+          if ($extra) { $notes += $extra, '' }
+          $notes += "Windows x64 installer built and tested by [ci run $env:RUN_ID]($env:RUN_URL) from commit ``$env:SHA``.",
+                    '', 'The installer is per user and needs no administrator rights. `SHA256SUMS.txt` holds its SHA-256.', ''
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -LiteralPath $notesFile -Value ($notes -join "`n") -Encoding utf8
+
+          $arguments = @('release', 'create', $env:TAG,
+            "release-assets/gesher-setup-$env:VERSION.exe", 'release-assets/SHA256SUMS.txt',
+            '--repo', $env:GITHUB_REPOSITORY, '--target', $env:SHA,
+            '--title', "Gesher $env:VERSION", '--notes-file', $notesFile, '--generate-notes')
+          # The updater reads GitHub's latest stable release.
+          if ($env:INPUT_DRAFT -ceq 'true') { $arguments += '--draft' } else { $arguments += '--latest' }
+          & gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
+
+      # The updater trusts the digest GitHub computes for the asset, so check that
+      # it is the one of the file CI tested.
+      - name: Check the published asset
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ci.outputs.version }}
+          TAG: ${{ steps.ci.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "gesher-setup-$env:VERSION.exe"
+          $local = Get-Item -LiteralPath "release-assets/$name"
+          $hash = (Get-FileHash -LiteralPath $local.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $repo = $env:GITHUB_REPOSITORY
+          $asset = $null
+          foreach ($attempt in 1..6) {
+            $releases = & gh api "repos/$repo/releases?per_page=50" | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'Could not list releases.' }
+            $release = @($releases | Where-Object { $_.tag_name -ceq $env:TAG })
+            if ($release.Count -ne 1) { throw "Expected one release for $env:TAG, found $($release.Count)." }
+            $asset = @($release[0].assets | Where-Object { $_.name -ceq $name })[0]
+            if ($asset -and $asset.state -ceq 'uploaded' -and $asset.digest) { break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $asset -or $asset.state -cne 'uploaded') { throw "$name was not uploaded." }
+          if ($asset.size -ne $local.Length) { throw "Uploaded size $($asset.size) differs from $($local.Length)." }
+          if ($asset.digest -cne "sha256:$hash") { throw "Asset digest '$($asset.digest)' differs from sha256:$hash." }
+          $state = if ($release[0].draft) { 'DRAFT (review it, then publish it on GitHub)' } else { 'published' }
+          "PASS  $env:TAG is $state - $($release[0].html_url)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
